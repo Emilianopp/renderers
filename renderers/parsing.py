@@ -17,8 +17,6 @@ failure) — see ``ToolCallParseStatus`` docstring for the rationale.
 from __future__ import annotations
 
 import json
-
-from renderers.reasoning import scan_reasoning
 from typing import Any
 
 from renderers.base import (
@@ -27,7 +25,7 @@ from renderers.base import (
     ToolCallParseStatus,
     ToolSpec,
 )
-
+from renderers.reasoning import scan_reasoning, split_tagged_reasoning
 
 # ── Schema-aware argument coercion ──────────────────────────────────
 #
@@ -486,6 +484,7 @@ def parse_glm(
     arg_value_end_id: int,
     tools: list[ToolSpec] | None = None,
     prefilled_thinking: bool = False,
+    thinking_enabled: bool | None = None,
 ) -> ParsedResponse:
     """Parse GLM completion tokens. Token-level thinking + arg_key/arg_value tool calls.
 
@@ -505,36 +504,23 @@ def parse_glm(
     behaves the same when the request carries no tools).
     """
     ids = _strip_stop_tokens(token_ids, stop_ids)
-    boundary = scan_reasoning(
-        tokenizer,
-        ids,
-        prefilled=prefilled_thinking,
-        open_id=think_id,
-        close_id=think_end_id,
-        tool_start_id=tool_call_id,
-        tool_start_closes_reasoning=True,
-        assistant_prefix="<|assistant|>",
+    split = split_tagged_reasoning(
+        _decode(tokenizer, ids),
+        thinking=prefilled_thinking if thinking_enabled is None else thinking_enabled,
+        enabled=thinking_enabled is not False,
+        tool_markers=("<tool_call>",),
     )
+    boundary = split.boundary
+    reasoning = boundary.text.rstrip() if boundary.text is not None else None
     if boundary.is_open:
         return ParsedResponse(
-            content="", reasoning_content=boundary.text, reasoning_complete=False
+            content=split.content,
+            reasoning_content=reasoning,
+            reasoning_complete=False,
         )
-
-    reasoning = None
-    parse_offset = 0
-    think_end = _find(ids, think_end_id)
-    if boundary.closed_by_tool:
-        reasoning = boundary.text.strip()
-        parse_offset = _find(ids, tool_call_id)
-    elif boundary.text is not None and think_end != -1:
-        reasoning = boundary.text.strip()
-        parse_offset = think_end + 1
-    ids = ids[parse_offset:]
-
-    tc_start = _find(ids, tool_call_id)
+    tc_start = _find(ids, tool_call_id) if split.tool_start is not None else -1
     tool_calls: list[ParsedToolCall] = []
     if tc_start != -1:
-        content_text = _decode(tokenizer, ids[:tc_start]).strip()
         tool_calls = _parse_glm_tool_calls(
             tokenizer,
             ids[tc_start:],
@@ -544,12 +530,48 @@ def parse_glm(
             arg_key_end_id,
             arg_value_id,
             arg_value_end_id,
-            section_offset=parse_offset + tc_start,
+            section_offset=tc_start,
             param_index=_build_param_type_index(tools),
             known_names=_extract_tool_names(tools),
         )
+        # Continue the reasoning/content grammar between complete tool calls,
+        # without interpreting delimiter-looking text inside their arguments.
+        content_parts = [split.content]
+        reasoning_parts = [boundary.text or ""]
+        cursor = tc_start
+        for call in tool_calls:
+            assert call.token_span is not None
+            start, end = call.token_span
+            between = split_tagged_reasoning(
+                _decode(tokenizer, ids[cursor:start]),
+                thinking=False,
+                enabled=thinking_enabled is not False,
+            )
+            content_parts.append(between.content)
+            reasoning_parts.append(between.boundary.text or "")
+            cursor = end
+        # A truncated tool body still owns the remaining bytes.
+        tail = (
+            ""
+            if tool_calls
+            and tool_calls[-1].status == ToolCallParseStatus.UNCLOSED_BLOCK
+            else _decode(tokenizer, ids[cursor:])
+        )
+        after = split_tagged_reasoning(
+            tail,
+            thinking=False,
+            enabled=thinking_enabled is not False,
+        )
+        content_parts.append(after.content)
+        reasoning_parts.append(after.boundary.text or "")
+        return ParsedResponse(
+            content="".join(content_parts).strip(),
+            reasoning_content="".join(reasoning_parts).rstrip() or None,
+            tool_calls=tool_calls,
+            reasoning_complete=not after.boundary.is_open,
+        )
     else:
-        content_text = _decode(tokenizer, ids).strip()
+        content_text = split.content
 
     return ParsedResponse(
         content=content_text,
@@ -1244,57 +1266,33 @@ def parse_deepseek_v4(
     reasoning opened in the completion is recognized independently.
     """
     ids = _strip_stop_tokens(token_ids, stop_ids)
-    boundary = scan_reasoning(
-        tokenizer,
-        ids,
-        prefilled=thinking_enabled,
-        open_id=think_start_id,
-        close_id=think_end_id,
-        tool_start_id=dsml_id,
-        tool_start_closes_reasoning=True,
-        assistant_prefix="<｜Assistant｜>",
+    split = split_tagged_reasoning(
+        _decode(tokenizer, ids),
+        thinking=thinking_enabled,
+        tool_markers=("<｜DSML｜tool_calls>", "<｜DSML｜toolcalls>", "<｜DSML｜tool>"),
     )
+    boundary = split.boundary
+    reasoning = boundary.text.rstrip() if boundary.text is not None else None
     if boundary.is_open:
         return ParsedResponse(
-            content="", reasoning_content=boundary.text, reasoning_complete=False
+            content=split.content,
+            reasoning_content=reasoning,
+            reasoning_complete=False,
         )
-
-    reasoning: str | None = None
-    content_offset = 0
-    think_end = _find(ids, think_end_id)
-    if boundary.closed_by_tool:
-        content_offset = int(bool(ids) and ids[0] == think_start_id)
-    elif boundary.text is not None and think_end != -1:
-        reasoning = boundary.text
-        content_offset = think_end + 1
-
-    content_ids = ids[content_offset:]
-    decoded = _decode(tokenizer, content_ids)
-    if boundary.closed_by_tool:
-        # Reasoning ran into DSML markup without </think>. The section opener
-        # is text around the atomic ｜DSML｜ token, so split before its tag
-        # and the canonical blank line.
-        prefix = _decode(tokenizer, content_ids[: _find(content_ids, dsml_id)])
-        section_pos = len(prefix.removesuffix("<"))
-        if decoded[:section_pos].endswith("\n\n"):
-            section_pos -= 2
-        reasoning = decoded[:section_pos]
-    else:
-        section_pos = decoded.find("\n\n<｜DSML｜tool_calls>")
-    if section_pos == -1 or dsml_id not in content_ids:
+    if split.tool_start is None:
         return ParsedResponse(
-            content=decoded,
+            content=split.content,
             reasoning_content=reasoning or None,
             tool_calls=[],
         )
-
-    content = "" if boundary.closed_by_tool else decoded[:section_pos]
-    section_text = decoded[section_pos:]
-    section_token_offset = content_offset + _decoded_char_to_token_index(
-        tokenizer,
-        content_ids,
-        section_pos,
+    # Include a BPE token straddling the opener's character boundary so tool
+    # spans remain offsets into the original sampled completion.
+    section_token_offset = _decoded_char_to_token_index(
+        tokenizer, ids, split.tool_start
     )
+    if len(_decode(tokenizer, ids[:section_token_offset])) > split.tool_start:
+        section_token_offset -= 1
+    section_text = _decode(tokenizer, ids[section_token_offset:])
     tool_calls = _parse_deepseek_v4_tool_calls(
         tokenizer,
         section_text,
@@ -1302,7 +1300,7 @@ def parse_deepseek_v4(
         section_offset=section_token_offset,
     )
     return ParsedResponse(
-        content=content,
+        content=split.content if split.content.strip() else "",
         reasoning_content=reasoning or None,
         tool_calls=tool_calls,
     )
@@ -1338,11 +1336,9 @@ def _parse_deepseek_v4_tool_calls(
     )
 
     tool_calls: list[ParsedToolCall] = []
-    outer_end = section_text.find(section_end)
     for invoke_match in re.finditer(r"<｜DSML｜invoke", section_text):
         start = invoke_match.start()
-        if outer_end != -1 and outer_end < start:
-            break
+        outer_end = section_text.find(section_end, start)
 
         close = section_text.find(invoke_end, start + len(invoke_start))
         unclosed = close == -1 or (outer_end != -1 and outer_end < close)

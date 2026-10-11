@@ -1,5 +1,6 @@
 """Reasoning boundaries, independent of response parsing and renderer classes."""
 
+import re
 from dataclasses import dataclass
 
 
@@ -14,6 +15,63 @@ class ReasoningBoundary:
     is_open: bool
     text: str | None
     closed_by_tool: bool = False
+
+
+@dataclass(frozen=True)
+class TaggedReasoning:
+    """A decoded view of tagged reasoning; sampled tokens remain untouched."""
+
+    boundary: ReasoningBoundary
+    content: str
+    tool_start: int | None = None
+
+
+def split_tagged_reasoning(
+    text: str,
+    *,
+    thinking: bool,
+    enabled: bool = True,
+    tool_markers: tuple[str, ...] = (),
+) -> TaggedReasoning:
+    """Reasoning transitions from vLLM 0.31's glm47_moe/deepseek_v4 engines.
+
+    Both grammars absorb duplicate delimiters, can reopen reasoning from
+    content, and transition to tools at their opener even before a later
+    ``</think>``. Tool bodies are handed to the tool parser unchanged.
+    GLM disables reasoning terminals when thinking is disabled; V4 retains
+    them and changes only the initial state.
+    """
+    markers = (*(("<think>", "</think>") if enabled else ()), *tool_markers)
+    if not markers:
+        return TaggedReasoning(ReasoningBoundary(False, None), text)
+    pattern = "|".join(re.escape(marker) for marker in markers)
+    active = thinking and enabled
+    opened = active
+    reasoning: list[str] = []
+    content: list[str] = []
+    start = 0
+    for match in re.finditer(pattern, text):
+        (reasoning if active else content).append(text[start : match.start()])
+        marker = match.group()
+        if marker in tool_markers:
+            return TaggedReasoning(
+                ReasoningBoundary(
+                    False, "".join(reasoning) if opened else None, active
+                ),
+                "".join(content),
+                match.start(),
+            )
+        if marker == "<think>":
+            active = True
+            opened = True
+        else:
+            active = False
+        start = match.end()
+    (reasoning if active else content).append(text[start:])
+    return TaggedReasoning(
+        ReasoningBoundary(active, "".join(reasoning) if opened else None),
+        "".join(content),
+    )
 
 
 def _decode(tokenizer, ids: list[int]) -> str:
@@ -100,7 +158,7 @@ def scan_reasoning(
 ) -> ReasoningBoundary:
     """Read the initial reasoning region without interpreting final content.
 
-    Tagged formats recognize an opener only at the beginning of the assistant
+    Tagged formats recognize an opener after leading whitespace in the assistant
     body, or continue reasoning opened in the prompt. A first close permanently
     switches to content. Atomic delimiters match token IDs, not lookalike text.
     Explicit channel formats can opt into channel transitions instead.
@@ -133,10 +191,11 @@ def scan_reasoning(
         # Reasoning-first grammars have one initial reasoning region. Once it
         # closes, later markers are content, not a new reasoning channel.
         if open_id is not None and close_id is not None:
-            explicit = bool(ids) and ids[0] == open_id
+            opening = next((i for i, token in enumerate(ids) if token == open_id), -1)
+            explicit = opening != -1 and not _decode(tokenizer, ids[:opening]).strip()
             if not prefilled and not explicit:
                 return ReasoningBoundary(False, None)
-            start = int(explicit)
+            start = opening + 1 if explicit else 0
             close = next((i for i in range(start, len(ids)) if ids[i] == close_id), -1)
             by_tool = False
             if close == -1 and tool_start_closes_reasoning:
@@ -146,14 +205,22 @@ def scan_reasoning(
                 by_tool = close != -1
             return ReasoningBoundary(
                 close == -1,
-                _decode(tokenizer, ids[start : close if close != -1 else len(ids)]),
+                _decode(
+                    tokenizer,
+                    [
+                        token
+                        for token in ids[start : close if close != -1 else len(ids)]
+                        if token != open_id
+                    ],
+                ),
                 by_tool,
             )
         text = _decode(tokenizer, ids)
-        explicit = text.startswith(open_marker)
+        opening = text.find(open_marker)
+        explicit = opening != -1 and not text[:opening].strip()
         if not prefilled and not explicit:
             return ReasoningBoundary(False, None)
-        start = len(open_marker) if explicit else 0
+        start = opening + len(open_marker) if explicit else 0
         close = text.find(close_marker, start)
         by_tool = False
         if close == -1 and tool_start_closes_reasoning:
@@ -162,7 +229,9 @@ def scan_reasoning(
             if tool_pos >= start:
                 close, by_tool = tool_pos, True
         return ReasoningBoundary(
-            close == -1, text[start : close if close != -1 else len(text)], by_tool
+            close == -1,
+            text[start : close if close != -1 else len(text)].replace(open_marker, ""),
+            by_tool,
         )
 
     events: list[tuple[int, int, bool | None]]

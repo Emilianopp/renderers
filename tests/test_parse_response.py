@@ -7,7 +7,6 @@ Runs against every (model, renderer) pair.
 from functools import lru_cache
 
 import pytest
-
 from renderers import create_renderer
 from renderers.base import ToolCallParseStatus, load_tokenizer
 
@@ -20,11 +19,11 @@ def _qwen3_vl():
 
 
 def test_parse_simple_content(model_name, tokenizer, renderer):
-    """Plain content, no thinking."""
+    """Bare text survives in the format's initial channel."""
     text = "Hello there!"
     ids = tokenizer.encode(text, add_special_tokens=False)
     parsed = renderer.parse_response(ids, prompt_ids=[])
-    assert "Hello" in parsed.content
+    assert "Hello" in parsed.content + (parsed.reasoning_content or "")
 
 
 def test_parse_thinking_and_content(model_name, tokenizer, renderer):

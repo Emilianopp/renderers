@@ -6,7 +6,6 @@ from functools import lru_cache
 
 import pytest
 from pydantic import TypeAdapter, ValidationError
-
 from renderers import (
     DeepSeekV4Renderer,
     DeepSeekV4RendererConfig,
@@ -16,7 +15,6 @@ from renderers import (
 )
 from renderers.base import MODEL_RENDERER_MAP, load_tokenizer
 from tests.reference_rendering import render_reference
-
 
 MODEL = "deepseek-ai/DeepSeek-V4-Flash-0731"
 BOS = "<｜begin▁of▁sentence｜>"
@@ -60,6 +58,30 @@ def _decode(renderer, messages, **kwargs):
         renderer.render_ids(messages, **kwargs),
         skip_special_tokens=False,
     )
+
+
+def test_repeated_tool_sections_keep_both_calls_and_drop_trailing_text():
+    renderer = _renderer(enable_thinking=True)
+    section = (
+        '<｜DSML｜tool_calls>\n<｜DSML｜invoke name="weather">\n\n'
+        "</｜DSML｜invoke>\n</｜DSML｜tool_calls>"
+    )
+    sampled = _tokenizer().encode(
+        "Reasoning</think>" + section + section + "<think>Ignored",
+        add_special_tokens=False,
+    )
+    parsed = renderer.parse_response(sampled)
+    assert parsed.reasoning_content == "Reasoning"
+    assert parsed.content == ""
+    assert parsed.reasoning_complete is True
+    assert [call.name for call in parsed.tool_calls] == ["weather", "weather"]
+    for call in parsed.tool_calls:
+        assert call.status == ToolCallParseStatus.OK
+        # The closing tag and newline can share a BPE token.
+        assert (
+            _tokenizer().decode(sampled[slice(*call.token_span)]).rstrip("\n")
+            == call.raw
+        )
 
 
 def test_registration_and_native_defaults():
@@ -224,7 +246,7 @@ def test_dsml_roundtrip_preserves_string_and_json_argument_types(prefilled, enab
     )
 
     assert parsed.reasoning_content == "Use weather."
-    assert parsed.content == "checking"
+    assert parsed.content == "checking\n\n"
     assert len(parsed.tool_calls) == 1
     call = parsed.tool_calls[0]
     assert call.status == ToolCallParseStatus.OK
@@ -440,8 +462,8 @@ def test_merged_followup_task_is_dropped_like_reference_encoder():
     assert text.endswith(f"{ASSISTANT}<think>")
 
 
-@pytest.mark.parametrize("prefix", ["", "\n"])
-def test_dsml_parser_requires_reference_encoders_two_newlines(prefix):
+@pytest.mark.parametrize("prefix", ["", "\n", "\n\n"])
+def test_dsml_parser_accepts_vllm_tool_opener_without_template_newlines(prefix):
     text = (
         f"{prefix}<｜DSML｜tool_calls>\n"
         '<｜DSML｜invoke name="weather">\n\n</｜DSML｜invoke>\n'
@@ -452,8 +474,10 @@ def test_dsml_parser_requires_reference_encoders_two_newlines(prefix):
         _tokenizer().encode(text, add_special_tokens=False)
     )
 
-    assert parsed.content == text
-    assert parsed.tool_calls == []
+    assert parsed.content == ""
+    assert [(call.name, call.arguments, call.status) for call in parsed.tool_calls] == [
+        ("weather", {}, ToolCallParseStatus.OK)
+    ]
 
 
 def test_rendered_masks_keep_dsml_sampled_and_tool_wrappers_scaffolded():
