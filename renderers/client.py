@@ -260,7 +260,7 @@ async def generate(
 
     Returns a dict with: request_id, prompt_ids, renderer_prompt_ids,
     mm_placeholders, completion_ids, completion_logprobs, content,
-    reasoning_content, tool_calls, finish_reason, routed_experts,
+    reasoning_content, tool_calls, finish_reason, routed_experts, eviction,
     multi_modal_data, prompt_attribution. ``renderer_prompt_ids`` is the
     unexpanded logical prompt when ``process_multimodal=False`` and ``None``
     otherwise.
@@ -429,6 +429,10 @@ async def generate(
         "reasoning_complete": parsed.reasoning_complete,
         "routed_experts": routed_experts,
         "sampling_mask": sampling_mask,
+        # KV-Streams engines report the KV eviction applied before this call as
+        # ``{"spans": [[start, end], ...], "at": position}`` in prompt positions;
+        # None from every other engine.
+        "eviction": choice.get("eviction"),
         # The mm sidecar consumed on the request side, surfaced back so
         # callers can persist it on the trajectory step for downstream
         # multi-turn bridging and training-sample construction.
