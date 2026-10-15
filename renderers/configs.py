@@ -1008,12 +1008,12 @@ class DeepSeekV41RendererConfig(DeepSeekV4RendererConfig):
     or system message, and thinking mode on by default.
     """
 
-    name: Literal["deepseek-v4.1"] = "deepseek-v4.1"  # type: ignore[assignment]
+    name: Literal["deepseek-v4.1"] = "deepseek-v4.1"
 
     enable_thinking: bool = True
     """Select thinking mode, the V4.1 encoder's default."""
 
-    reasoning_effort: Literal["low", "high", "max"] | int = "high"  # type: ignore[assignment]
+    reasoning_effort: Literal["low", "high", "max"] | int = "high"
     """Thinking-only budget: an int in [1, 100], or ``low`` / ``high`` / ``max`` (50 / 75 / 100)."""
 
     @model_validator(mode="after")

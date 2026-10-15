@@ -43,7 +43,10 @@ def _split_inline_reasoning(message: Message) -> Message:
     if not content.startswith(_THINK_START) or _THINK_END not in content:
         return message
     reasoning, content = content.removeprefix(_THINK_START).split(_THINK_END, 1)
-    return {**message, "reasoning_content": reasoning, "content": content}
+    split = message.copy()
+    split["reasoning_content"] = reasoning
+    split["content"] = content
+    return split
 
 
 class DeepSeekV41Renderer(DeepSeekV4Renderer):
@@ -82,10 +85,12 @@ class DeepSeekV41Renderer(DeepSeekV4Renderer):
             and not self.config.enable_thinking
         ):
             # Without an effort prefix, the system message itself opens with the System token.
-            first = {
-                **messages[0],
-                "content": _SYSTEM + (messages[0].get("content") or ""),
-            }
+            first = messages[0].copy()
+            if not isinstance(first["content"], str):
+                raise NotImplementedError(
+                    "the DeepSeek-V4.1 renderer renders text-only system messages"
+                )
+            first["content"] = _SYSTEM + first["content"]
             messages = [first, *messages[1:]]
         return super().render(
             messages, tools=tools, add_generation_prompt=add_generation_prompt
