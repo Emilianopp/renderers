@@ -888,3 +888,96 @@ def test_generate_passes_through_the_engine_eviction_record():
 
     client.choice["eviction"] = {"spans": [[2, 5], [7, 9]], "at": 11}
     assert _run_generate(client)["eviction"] == {"spans": [[2, 5], [7, 9]], "at": 11}
+
+
+def _session_generate(client, prompt_ids, session="trace-a"):
+    return asyncio.run(
+        generate(
+            client=client,
+            renderer=_NoRenderRenderer(),
+            messages=[{"role": "user", "content": "hi"}],
+            model="test-model",
+            prompt_ids=prompt_ids,
+            max_prompt_len=10_000,
+            extra_headers={"X-Session-ID": session} if session else None,
+        )
+    )
+
+
+@pytest.fixture
+def fresh_sessions():
+    from renderers import client as client_module
+
+    client_module._session_held.clear()
+    client_module._sessionless_endpoints.clear()
+    yield
+    client_module._session_held.clear()
+    client_module._sessionless_endpoints.clear()
+
+
+def test_session_turn_that_extends_the_last_call_sends_only_its_new_tokens(fresh_sessions):
+    client = _FakeClient()
+    _session_generate(client, [11, 12, 13])
+    # Next turn = last prompt + its completion [7, 8] + new tokens.
+    result = _session_generate(client, [11, 12, 13, 7, 8, 20, 21])
+    first, second = (call["body"] for call in client.calls)
+    assert first["token_ids"] == [11, 12, 13] and "prefix_len" not in first
+    assert second["token_ids"] == [20, 21] and second["prefix_len"] == 5
+    # The caller still gets the full prompt (the server no longer echoes it).
+    assert result["prompt_ids"] == [11, 12, 13, 7, 8, 20, 21]
+
+
+def test_session_turn_that_rewrites_history_sends_the_full_prompt(fresh_sessions):
+    client = _FakeClient()
+    _session_generate(client, [11, 12, 13])
+    _session_generate(client, [11, 99, 13, 7, 8, 20])
+    assert client.calls[1]["body"]["token_ids"] == [11, 99, 13, 7, 8, 20]
+    assert "prefix_len" not in client.calls[1]["body"]
+
+
+def test_without_a_session_header_every_request_is_full(fresh_sessions):
+    client = _FakeClient()
+    _session_generate(client, [11, 12, 13], session=None)
+    _session_generate(client, [11, 12, 13, 7, 8, 20], session=None)
+    assert all("prefix_len" not in call["body"] for call in client.calls)
+
+
+def test_a_rejected_delta_is_resent_in_full(fresh_sessions):
+    from openai import ConflictError
+
+    class _DesyncedClient(_FakeClient):
+        async def post(self, path, *, cast_to=dict, body=None, options=None):
+            if body and body.get("prefix_len"):
+                self.calls.append({"body": body})
+                request = httpx.Request("POST", path)
+                raise ConflictError("desync", response=httpx.Response(409, request=request), body=None)
+            return await super().post(path, cast_to=cast_to, body=body, options=options)
+
+    client = _DesyncedClient()
+    _session_generate(client, [11, 12, 13])
+    result = _session_generate(client, [11, 12, 13, 7, 8, 20])
+    bodies = [call["body"] for call in client.calls]
+    assert [b.get("prefix_len") for b in bodies] == [None, 5, None]
+    assert bodies[2]["token_ids"] == [11, 12, 13, 7, 8, 20]
+    assert result["prompt_ids"] == [11, 12, 13, 7, 8, 20]
+
+
+def test_a_server_without_sessions_gets_no_more_deltas(fresh_sessions):
+    from openai import ConflictError
+
+    class _SessionlessClient(_FakeClient):
+        async def post(self, path, *, cast_to=dict, body=None, options=None):
+            if body and body.get("prefix_len"):
+                self.calls.append({"body": body})
+                request = httpx.Request("POST", path)
+                error_body = {"message": "needs a session", "code": 409, "type": "session_unavailable"}
+                raise ConflictError("no sessions", response=httpx.Response(409, request=request), body=error_body)
+            return await super().post(path, cast_to=cast_to, body=body, options=options)
+
+    client = _SessionlessClient()
+    prompt = [11, 12, 13]
+    for _ in range(4):
+        _session_generate(client, prompt)
+        prompt = prompt + [7, 8, 20]
+    # One rejected delta, then full requests only.
+    assert [call["body"].get("prefix_len") for call in client.calls] == [None, 5, None, None, None]
