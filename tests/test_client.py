@@ -880,3 +880,11 @@ def test_generate_forwards_reasoning_state_without_classifying_acceptance(
     assert result["completion_ids"] == [7, 8]
     assert result["completion_logprobs"] == [-0.1, -0.2]
     assert result["content"] == ""
+
+
+def test_generate_passes_through_the_engine_eviction_record():
+    client = _FakeClient()
+    assert _run_generate(client)["eviction"] is None
+
+    client.choice["eviction"] = {"spans": [[2, 5], [7, 9]], "at": 11}
+    assert _run_generate(client)["eviction"] == {"spans": [[2, 5], [7, 9]], "at": 11}
