@@ -69,6 +69,7 @@ class _FakeClient:
         self.calls = []
         self.base_url = "http://fake-host:8000/v1"
         self.usage = None
+        self.session = False  # mark responses as run on a KV-Streams session
         routed_experts = np.array([[[1]], [[2]]], dtype=np.uint8)
         self.choice = {
             "index": 0,
@@ -96,6 +97,8 @@ class _FakeClient:
         }
         if self.usage is not None:
             payload["usage"] = self.usage
+        if self.session:
+            payload["session"] = True
         if body and body.get("content_parts"):
             payload["prompt_token_ids"] = [1, 2, 2, 3]
             payload["mm_placeholders"] = {"image": [{"offset": 1, "length": 2}]}
@@ -909,14 +912,18 @@ def fresh_sessions():
     from renderers import client as client_module
 
     client_module._session_held.clear()
-    client_module._sessionless_endpoints.clear()
     yield
     client_module._session_held.clear()
-    client_module._sessionless_endpoints.clear()
+
+
+def _session_client(cls=None):
+    client = (cls or _FakeClient)()
+    client.session = True
+    return client
 
 
 def test_session_turn_that_extends_the_last_call_sends_only_its_new_tokens(fresh_sessions):
-    client = _FakeClient()
+    client = _session_client()
     _session_generate(client, [11, 12, 13])
     # Next turn = last prompt + its completion [7, 8] + new tokens.
     result = _session_generate(client, [11, 12, 13, 7, 8, 20, 21])
@@ -928,7 +935,7 @@ def test_session_turn_that_extends_the_last_call_sends_only_its_new_tokens(fresh
 
 
 def test_session_turn_that_rewrites_history_sends_the_full_prompt(fresh_sessions):
-    client = _FakeClient()
+    client = _session_client()
     _session_generate(client, [11, 12, 13])
     _session_generate(client, [11, 99, 13, 7, 8, 20])
     assert client.calls[1]["body"]["token_ids"] == [11, 99, 13, 7, 8, 20]
@@ -936,7 +943,7 @@ def test_session_turn_that_rewrites_history_sends_the_full_prompt(fresh_sessions
 
 
 def test_without_a_session_header_every_request_is_full(fresh_sessions):
-    client = _FakeClient()
+    client = _session_client()
     _session_generate(client, [11, 12, 13], session=None)
     _session_generate(client, [11, 12, 13, 7, 8, 20], session=None)
     assert all("prefix_len" not in call["body"] for call in client.calls)
@@ -953,7 +960,7 @@ def test_a_rejected_delta_is_resent_in_full(fresh_sessions):
                 raise ConflictError("desync", response=httpx.Response(409, request=request), body=None)
             return await super().post(path, cast_to=cast_to, body=body, options=options)
 
-    client = _DesyncedClient()
+    client = _session_client(_DesyncedClient)
     _session_generate(client, [11, 12, 13])
     result = _session_generate(client, [11, 12, 13, 7, 8, 20])
     bodies = [call["body"] for call in client.calls]
@@ -962,22 +969,24 @@ def test_a_rejected_delta_is_resent_in_full(fresh_sessions):
     assert result["prompt_ids"] == [11, 12, 13, 7, 8, 20]
 
 
-def test_a_server_without_sessions_gets_no_more_deltas(fresh_sessions):
-    from openai import ConflictError
-
-    class _SessionlessClient(_FakeClient):
-        async def post(self, path, *, cast_to=dict, body=None, options=None):
-            if body and body.get("prefix_len"):
-                self.calls.append({"body": body})
-                request = httpx.Request("POST", path)
-                error_body = {"message": "needs a session", "code": 409, "type": "session_unavailable"}
-                raise ConflictError("no sessions", response=httpx.Response(409, request=request), body=error_body)
-            return await super().post(path, cast_to=cast_to, body=body, options=options)
-
-    client = _SessionlessClient()
+def test_a_server_without_sessions_always_gets_full_prompts(fresh_sessions):
+    # vLLM (or any server that does not mark responses "session") sees exactly the
+    # requests it saw before deltas existed, header or not.
+    client = _FakeClient()
     prompt = [11, 12, 13]
-    for _ in range(4):
+    for _ in range(3):
         _session_generate(client, prompt)
         prompt = prompt + [7, 8, 20]
-    # One rejected delta, then full requests only.
-    assert [call["body"].get("prefix_len") for call in client.calls] == [None, 5, None, None, None]
+    assert all("prefix_len" not in call["body"] for call in client.calls)
+    assert [len(call["body"]["token_ids"]) for call in client.calls] == [3, 6, 9]
+
+
+def test_a_response_not_run_on_the_session_ends_deltas_for_that_trace(fresh_sessions):
+    # A busy trace's full resend runs without its session: the next turn goes in full.
+    client = _session_client()
+    _session_generate(client, [11, 12, 13])
+    client.session = False
+    _session_generate(client, [11, 12, 13, 7, 8, 20])
+    client.session = True
+    _session_generate(client, [11, 12, 13, 7, 8, 20, 7, 8, 30])
+    assert [call["body"].get("prefix_len") for call in client.calls] == [None, 5, None]

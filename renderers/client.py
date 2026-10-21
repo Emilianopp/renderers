@@ -33,18 +33,16 @@ _request_logger = logging.getLogger("renderers.client")
 
 # KV-Streams sessions (prime-rl's SGLang server holds each trace's tokens, keyed
 # by this header): what each session held after its last call, so a turn that
-# extends it sends only its new tokens plus ``prefix_len``. Per process; a miss
-# or a stale entry only costs one full request.
+# extends it sends only its new tokens plus ``prefix_len``. Only a response
+# marked ``"session": true`` is remembered, so a server that keeps no sessions
+# (e.g. vLLM) always gets full prompts. Per process; a miss or a stale entry only
+# costs one full request. Entries are (length, hash of the tokens): small.
 SESSION_ID_HEADER = "X-Session-ID"
 _SESSION_CACHE_SIZE = 8192
-_session_held: OrderedDict[tuple[str, str], tuple[list[int], list[int]]] = OrderedDict()
-# Endpoints that answered a delta with "session_unavailable" (no sessions there).
-_sessionless_endpoints: set[str] = set()
+_session_held: OrderedDict[tuple[str, str], tuple[int, int]] = OrderedDict()
 
 
 def _session_key(endpoint: str, extra_headers: Mapping[str, str] | None) -> tuple[str, str] | None:
-    if endpoint in _sessionless_endpoints:
-        return None
     for name, value in (extra_headers or {}).items():
         if name.lower() == SESSION_ID_HEADER.lower() and value:
             return endpoint, str(value)
@@ -56,18 +54,19 @@ def _session_prefix_len(key: tuple[str, str], prompt_ids: list[int]) -> int:
     held = _session_held.get(key)
     if held is None:
         return 0
-    prompt, completion = held
-    n = len(prompt) + len(completion)
-    if len(prompt_ids) <= n or prompt_ids[: len(prompt)] != prompt or prompt_ids[len(prompt) : n] != completion:
+    n, digest = held
+    if len(prompt_ids) <= n or hash(tuple(prompt_ids[:n])) != digest:
         return 0
     return n
 
 
-def _remember_session(key: tuple[str, str], prompt_ids: list[int], completion_ids: list[int]) -> None:
-    _session_held[key] = (prompt_ids, completion_ids)
+def _remember_session(key: tuple[str, str], tokens: list[int]) -> None:
+    _session_held[key] = (len(tokens), hash(tuple(tokens)))
     _session_held.move_to_end(key)
     while len(_session_held) > _SESSION_CACHE_SIZE:
         _session_held.popitem(last=False)
+
+
 ROUTED_EXPERTS_DATA_PREFIX = b'"routed_experts":{"data":"'
 # vLLM uses this value both when sampled-token evidence is missing and as a
 # lower-bound clamp, so receiving it cannot prove the real logprob was returned.
@@ -416,13 +415,11 @@ async def generate(
         post_kwargs["body"] = {**body, "token_ids": prompt_ids[prefix_len:], "prefix_len": prefix_len}
     try:
         raw_response = await client.post(endpoint, **post_kwargs)
-    except ConflictError as error:
+    except ConflictError:
         if not prefix_len:
             raise
         # The session no longer holds what we sent last (reopened, busy, gone): resend in full.
         _session_held.pop(session, None)
-        if isinstance(error.body, dict) and error.body.get("type") == "session_unavailable":
-            _sessionless_endpoints.add(endpoint)
         post_kwargs["body"] = body
         raw_response = await client.post(endpoint, **post_kwargs)
     data = parse_generate_response(raw_response.content)
@@ -442,7 +439,10 @@ async def generate(
 
     completion_logprobs = _parse_completion_logprobs(choice, completion_ids)
     if session is not None:
-        _remember_session(session, list(prompt_ids), list(completion_ids))
+        if data.get("session"):
+            _remember_session(session, [*prompt_ids, *completion_ids])
+        else:  # not run on the session (no sessions there, or a busy trace): don't delta next turn
+            _session_held.pop(session, None)
 
     parsed = renderer.parse_response(
         completion_ids,
