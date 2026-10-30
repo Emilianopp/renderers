@@ -15,6 +15,7 @@ for _case in MODEL_CATALOG:
 
 _GLM = {"glm-4.5", "glm-5", "glm-5.1", "glm-5.3", "glm-5.3-flash"}
 _REOPENING_TAGS = _GLM | {"deepseek-v4"}
+_KEEPS_STOPPED_REASONING = {"qwen3.5", "qwen3.6", "qwen3.8"}
 
 
 @lru_cache(None)
@@ -114,7 +115,12 @@ def test_every_reasoning_bridge_preserves_prefix_or_refuses_sampled_stop(name):
             prompt, incomplete + [stop], new_messages
         )
         # Harmony's handoff token closes analysis; its return token does not.
-        if name == "gpt-oss" and [stop] == _encode(tok, "<|call|>"):
+        # The Qwen3.5 family keeps a reply that stopped inside its think block as
+        # sampled rather than refusing (see tests/test_qwen35_history_thinking.py).
+        if name in _KEEPS_STOPPED_REASONING:
+            assert stopped_bridge is not None
+            assert stopped_bridge.token_ids[: prefix_len + 1] == prompt + incomplete + [stop]
+        elif name == "gpt-oss" and [stop] == _encode(tok, "<|call|>"):
             assert stopped_bridge is not None
             assert stopped_bridge.token_ids[: prefix_len + 1] == prompt + incomplete + [
                 stop

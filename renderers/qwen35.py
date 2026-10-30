@@ -729,9 +729,15 @@ class Qwen35Renderer:
             tool_start_id=self._tool_call,
             tool_start_closes_reasoning=True,
         )
-        if boundary.is_open:
-            if any(t in self.get_stop_token_ids() for t in previous_completion_ids):
-                return None
+        # A reply cut off inside its think block gets the close it never sampled. A
+        # reply that stopped inside it (the model ended its turn without
+        # ``</think>``) is kept as sampled: the bridge's job is an exact continuation
+        # of the tokens the engine holds, and the full re-render a refusal forces
+        # cannot reproduce an unclosed block - it re-tokenizes every earlier turn
+        # from messages, which forks the prompt from the engine's streaming session.
+        if boundary.is_open and not any(
+            t in self.get_stop_token_ids() for t in previous_completion_ids
+        ):
             previous_completion_ids = [*previous_completion_ids, self._think_end]
 
         if should_rerender_for_thinking_retention(
